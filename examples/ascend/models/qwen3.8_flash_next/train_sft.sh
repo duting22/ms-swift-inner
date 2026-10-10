@@ -25,6 +25,9 @@ export PLE_FUSED_KERNEL=0
 export MODEL=/path/to/Qwen3.8-Flash-Next
 export DATASET=/path/to/dataset
 
+# 如果需要打开MTP训练，可以在下面添加MTP相关参数，例如：
+#   --mtp_num_layers 1 \
+#   --mtp_loss_scaling_factor 0.1 \
 
 megatron sft \
     --model "$MODEL" \
@@ -61,7 +64,7 @@ megatron sft \
     --recompute_num_layers 1 \
     --packing true \
     --padding_free true \
-    --num_iters 100 \
+    --train_iters 100 \
     --finetune true \
     --cross_entropy_loss_fusion true \
     --use_precision_aware_optimizer false \
