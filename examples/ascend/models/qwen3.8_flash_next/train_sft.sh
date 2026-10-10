@@ -35,7 +35,7 @@ megatron sft \
     --enable_thinking false \
     --tuner_type full \
     --bf16 true \
-    --nccl_comm_warmup true \
+    --nccl_comm_warmup false \
     --overlap_grad_reduce false \
     --overlap_param_gather false \
     --tensor_model_parallel_size 8 \
