@@ -3,8 +3,8 @@
 # bridge
 git clone https://github.com/modelscope/mcore-bridge.git
 cd mcore-bridge
-git checkout bc58ea9c
-git apply mcore-bridge.bc58ea9c.patch
+git checkout 8b567b34e3f9a1087624d45ef0e9474f1021a2f3
+git apply mcore-bridge.8b567b34.patch
 pip install -e .
 
 # megatron

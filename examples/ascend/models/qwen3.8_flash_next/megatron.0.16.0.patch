@@ -1,5 +1,294 @@
+diff --git a/megatron/core/distributed/distributed_data_parallel.py b/megatron/core/distributed/distributed_data_parallel.py
+index 55179ff3024251f41679b3c5eaa0b8706d26d549..8b5638110db7084d03d084252e320ad416d466ab 100644
+--- a/megatron/core/distributed/distributed_data_parallel.py
++++ b/megatron/core/distributed/distributed_data_parallel.py
+@@ -107,6 +107,7 @@ class DistributedDataParallel(_BaseDataParallel):
+         param_to_name = {}
+         dense_params = []
+         expert_parallel_params = []
++        ple_parallel_params = []
+         self.params_with_grad = []
+         for name, param in self.module.named_parameters():
+             if not param.requires_grad:
+@@ -119,13 +120,15 @@ class DistributedDataParallel(_BaseDataParallel):
+             param.grad_added_to_main_grad = False
+             param_to_name[param] = name
+ 
+-            if getattr(param, 'allreduce', True):
++            if getattr(param, 'ple_tp_cp_sharded', False):
++                ple_parallel_params.append(param)
++            elif getattr(param, 'allreduce', True):
+                 dense_params.append(param)
+             else:
+                 expert_parallel_params.append(param)
+ 
+         def _allocate_buffers_for_parameters(
+-            input_params, data_parallel_group, gradient_scaling_factor
++            input_params, data_parallel_group, gradient_scaling_factor, *, is_ple=False
+         ):
+             param_and_grad_dtype_to_params = {}
+             param_and_grad_dtype_to_offsets = {}
+@@ -194,7 +197,7 @@ class DistributedDataParallel(_BaseDataParallel):
+             buffers = []
+             pg_collection = ProcessGroupCollection()
+             pg_collection.tp = self.tp_group
+-            pg_collection.dp_cp = self.dp_cp_group
++            pg_collection.dp_cp = self.dp_group if is_ple else self.dp_cp_group
+             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
+                 buffers.append(
+                     _ParamAndGradBuffer(
+@@ -301,6 +304,30 @@ class DistributedDataParallel(_BaseDataParallel):
+             )
+         )
+ 
++        if ple_parallel_params and self.ddp_config.num_distributed_optimizer_instances != 1:
++            raise ValueError(
++                'PLE TP×CP sharding requires num_distributed_optimizer_instances=1.'
++            )
++
++        # CP contributions have already been summed at the lookup output. Preserve
++        # the original loss normalization while communicating only across pure DP.
++        if config.calculate_per_token_loss:
++            ple_gradient_scaling_factor = 1.0
++        elif self.ddp_config.average_in_collective:
++            ple_gradient_scaling_factor = self.dp_group.size() / self.dp_cp_group.size()
++        else:
++            ple_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
++
++        self.ple_parallel_buffers = []
++        self.ple_parallel_bucket_groups = []
++        if ple_parallel_params:
++            self.ple_parallel_buffers, self.ple_parallel_bucket_groups = _allocate_buffers_for_parameters(
++                ple_parallel_params,
++                self.dp_group,
++                gradient_scaling_factor=ple_gradient_scaling_factor,
++                is_ple=True,
++            )
++
+         # Delete references to weight_tensor if they exist since we don't want two parameter copies
+         # if we re-mapped parameters (which happens when we use the distributed optimizer).
+         # This is a temporary workaround around a TE bug that is fixed with
+@@ -452,12 +479,16 @@ class DistributedDataParallel(_BaseDataParallel):
+         """
+         Context manager that turns off gradient synchronization.
+         """
+-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
++        for bucket_group in (
++            self.bucket_groups + self.expert_parallel_bucket_groups + self.ple_parallel_bucket_groups
++        ):
+             bucket_group.is_last_microbatch = False
+         try:
+             yield
+         finally:
+-            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
++            for bucket_group in (
++                self.bucket_groups + self.expert_parallel_bucket_groups + self.ple_parallel_bucket_groups
++            ):
+                 bucket_group.is_last_microbatch = True
+ 
+     def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
+@@ -479,7 +510,9 @@ class DistributedDataParallel(_BaseDataParallel):
+             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
+                 return
+ 
+-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
++        for bucket_group in (
++            self.bucket_groups + self.expert_parallel_bucket_groups + self.ple_parallel_bucket_groups
++        ):
+             bucket_group.start_param_sync(force_sync=force_sync)
+ 
+             if not self.ddp_config.overlap_param_gather:
+@@ -519,7 +552,9 @@ class DistributedDataParallel(_BaseDataParallel):
+         calls. When overlap_grad_reduce is set to False, calls synchronous
+         communication ops.
+         """
+-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
++        for bucket_group in (
++            self.bucket_groups + self.expert_parallel_bucket_groups + self.ple_parallel_bucket_groups
++        ):
+             bucket_group.start_grad_sync()
+ 
+     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+@@ -531,12 +566,14 @@ class DistributedDataParallel(_BaseDataParallel):
+         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
+         communication ops.
+         """
+-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
++        for bucket_group in (
++            self.bucket_groups + self.expert_parallel_bucket_groups + self.ple_parallel_bucket_groups
++        ):
+             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+ 
+     def scale_gradients(self, scaling_factor: float):
+         """Scale all gradients inside the buffers by `scaling_factor`."""
+-        for buffer in self.buffers + self.expert_parallel_buffers:
++        for buffer in self.buffers + self.expert_parallel_buffers + self.ple_parallel_buffers:
+             buffer.scale_gradients(scaling_factor)
+ 
+     def zero_grad_buffer(self):
+@@ -550,9 +587,11 @@ class DistributedDataParallel(_BaseDataParallel):
+             # to True, and there will be a double-GA.
+             for param in self.params_with_grad:
+                 param.grad_added_to_main_grad = False
+-        for buffer in self.buffers + self.expert_parallel_buffers:
++        for buffer in self.buffers + self.expert_parallel_buffers + self.ple_parallel_buffers:
+             buffer.reset()
+-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
++        for bucket_group in (
++            self.bucket_groups + self.expert_parallel_bucket_groups + self.ple_parallel_bucket_groups
++        ):
+             bucket_group.reset()
+ 
+     def broadcast_params(self):
+@@ -560,9 +599,9 @@ class DistributedDataParallel(_BaseDataParallel):
+         Syncs parameters across all DP ranks.
+         """
+         for param in self.module.parameters():
+-            is_expert_parallel = not getattr(param, 'allreduce', True)
+-
+-            if is_expert_parallel:
++            if getattr(param, 'ple_tp_cp_sharded', False):
++                data_parallel_group = self.dp_group
++            elif not getattr(param, 'allreduce', True):
+                 data_parallel_group = self.expt_dp_group
+             else:
+                 data_parallel_group = self.dp_cp_group
+@@ -587,7 +626,7 @@ class DistributedDataParallel(_BaseDataParallel):
+         if synchronize:
+             torch.cuda.synchronize()
+ 
+-        for buffer in self.buffers + self.expert_parallel_buffers:
++        for buffer in self.buffers + self.expert_parallel_buffers + self.ple_parallel_buffers:
+             buffer.offload_to_cpu(move_params=False, move_grads=True)
+ 
+         if empty_cache:
+@@ -604,7 +643,7 @@ class DistributedDataParallel(_BaseDataParallel):
+         Args:
+             synchronize: Whether to call torch.cuda.synchronize() after allocation.
+         """
+-        for buffer in self.buffers + self.expert_parallel_buffers:
++        for buffer in self.buffers + self.expert_parallel_buffers + self.ple_parallel_buffers:
+             buffer.reload_from_cpu(move_params=False, move_grads=True)
+ 
+         if synchronize:
+diff --git a/megatron/core/optimizer/__init__.py b/megatron/core/optimizer/__init__.py
+index 11aa6c49585bab467cb11545f50d06a63245c4d0..a21d75a7d318351d810256fe18a6f81e787c1b62 100644
+--- a/megatron/core/optimizer/__init__.py
++++ b/megatron/core/optimizer/__init__.py
+@@ -131,7 +131,7 @@ def _get_param_groups(
+         List of parameter groups.
+     """
+ 
+-    # Map (pg_overrides, is_expert_parallel) to params.
++    # Keep dense, expert and PLE parameters in separate optimizer groups.
+     params_map = {}
+ 
+     if config_overrides is None:
+@@ -163,12 +163,13 @@ def _get_param_groups(
+                 param_override = None
+ 
+             is_expert_parallel = not getattr(param, 'allreduce', True)
++            is_ple_parallel = getattr(param, 'ple_tp_cp_sharded', False)
+ 
+             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
+             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
+                 param_group_override_to_tuple(param_override)
+             )
+-            key = (param_override_tuple, is_expert_parallel)
++            key = (param_override_tuple, is_expert_parallel, is_ple_parallel)
+             if key not in params_map:
+                 params_map[key] = []
+             params_map[key].append(param)
+@@ -186,8 +187,8 @@ def _get_param_groups(
+     # Need to pick one of the param_override_tuples to use for the param group.
+     param_groups = []
+     # Sort keys, None first.
+-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
+-        param_override_tuple, is_expert_parallel = key
++    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0], x[1], x[2])):
++        param_override_tuple, is_expert_parallel, is_ple_parallel = key
+         params = params_map[key] if key in params_map else []
+         if param_override_tuple is None:
+             param_override: ParamGroupOverride = {}
+@@ -220,6 +221,7 @@ def _get_param_groups(
+         param_group = {
+             'params': params,
+             'is_expert_parallel': is_expert_parallel,
++            'is_ple_parallel': is_ple_parallel,
+             'default_config': uses_default_lr_schedule,
+             **default_config,
+             **param_override,  # keep **param_override last so that users can override other fields.
+@@ -612,7 +614,7 @@ def get_megatron_optimizer(
+             model_chunk_offset=model_chunk_offset,
+             config=config,
+             config_overrides=config_overrides,
+-            filter_fn=lambda g: not g['is_expert_parallel'],
++            filter_fn=lambda g: not g['is_expert_parallel'] and not g['is_ple_parallel'],
+             buffer_name='buffers',
+         )
+         for model_chunk in dense_model_chunks:
+@@ -644,6 +646,59 @@ def get_megatron_optimizer(
+         )
+         model_chunk_offset += 1
+ 
++    ple_param_groups, ple_buffers = _get_param_groups_and_buffers(
++        model_chunks,
++        model_chunk_offset=0,
++        config=config,
++        config_overrides=config_overrides,
++        filter_fn=lambda g: g['is_ple_parallel'],
++        buffer_name='ple_parallel_buffers',
++    )
++    if ple_param_groups:
++        if config.overlap_param_gather_with_optimizer_step:
++            raise NotImplementedError(
++                'PLE TP×CP sharding does not support '
++                'overlap_param_gather_with_optimizer_step.'
++            )
++        assert not ddp_config.use_megatron_fsdp
++        assert ddp_config.use_distributed_optimizer
++        assert ddp_config.num_distributed_optimizer_instances == 1
++
++        if dump_param_to_param_group_map is not None:
++            for param_group in ple_param_groups:
++                for param in param_group['params']:
++                    param_name = get_global_unique_param_name(model_chunks, param)
++                    param_to_param_group[param_name] = param_group_id
++                param_group_id += 1
++
++        ple_dp_group = process_groups_dict['dp_group']
++        ple_dp_group_gloo = (
++            parallel_state.get_data_parallel_group_gloo(with_context_parallel=False)
++            if use_gloo_process_groups
++            else None
++        )
++        # Each CP coordinate owns different rows, so it needs a distinct
++        # optimizer checkpoint key as well as its own pure-DP replica group.
++        ple_dp_group_idx = (
++            model_parallel_rank * parallel_state.get_context_parallel_world_size()
++            + parallel_state.get_context_parallel_rank()
++        )
++        ple_optimizer = _get_megatron_optimizer_based_on_param_groups(
++            config=config,
++            model_chunks=model_chunks,
++            param_groups=ple_param_groups,
++            per_model_buffers=ple_buffers,
++            model_parallel_group=mp_group,
++            data_parallel_group=ple_dp_group,
++            data_parallel_group_gloo=ple_dp_group_gloo,
++            data_parallel_group_idx=ple_dp_group_idx,
++            intra_dist_opt_group=intra_dist_opt_group,
++            distributed_optimizer_instance_id=0,
++            pg_collection=pg_collection,
++        )
++        ple_optimizer.is_ple_optimizer = True
++        optimizers.append(ple_optimizer)
++
+     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
+         model_chunks,
+         model_chunk_offset=0,
 diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
-index 69f442eb2..cb4ff9498 100644
+index 69f442eb2d4fec51e04d355f8aa97bcfe7b9057e..cb4ff9498192590200bf0436295667e3cd11e39b 100644
 --- a/megatron/core/tensor_parallel/layers.py
 +++ b/megatron/core/tensor_parallel/layers.py
 @@ -253,6 +253,13 @@ class VocabParallelEmbedding(torch.nn.Module):
