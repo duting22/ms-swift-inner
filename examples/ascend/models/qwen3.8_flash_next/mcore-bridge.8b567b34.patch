@@ -165,7 +165,7 @@ index 6231c0b1960f46c6a58825b3965bc606ce2861f8..ddcc98785e2d0cc909bfe5398e2d1fde
          k_in = offs_k < T
  
 diff --git a/src/mcore_bridge/model/modules/ple.py b/src/mcore_bridge/model/modules/ple.py
-index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..d377afad15373363a14529af7391d151ff530e33 100644
+index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..5405b00294e6f5d7e1ab4b13aea237d64cd28600 100644
 --- a/src/mcore_bridge/model/modules/ple.py
 +++ b/src/mcore_bridge/model/modules/ple.py
 @@ -7,16 +7,19 @@ from megatron.core import parallel_state
@@ -369,7 +369,45 @@ index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..d377afad15373363a14529af7391d151
          ``VocabParallelEmbedding`` (the default, which receives gradients and so
          must not be silently dropped from the checkpoint). Bulk API: consumes
          :meth:`iter_export_table_to_hf` into ``hf_state_dict``.
-@@ -372,7 +391,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+@@ -337,12 +356,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+         valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
+         return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
+ 
+-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
++    def forward(self, input_ids: torch.Tensor, packed_seq_lens: Optional[List[int]] = None) -> torch.Tensor:
+         """input_ids: [rows, L] -> embeddings [rows, L, embedding_dim].
+ 
+         Training variant of transformers ``forward(input_ids, past_key_values,
+-        layer_idx)``: the previous context is eos padding (fresh request),
+-        prepended here and dropped from the ids afterwards.
++        layer_idx)``: unpacked inputs prepend eos history for a fresh request;
++        packed inputs reset that history at each segment boundary.
+         """
+         input_ids = input_ids.long()
+         # mcore-specific: training has no conv-state cache; a fresh request
+@@ -350,9 +369,18 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+         # of transformers `forward` returns exactly this). The latest HF
+         # constructor also takes a cache-only `layer_idx`, which has no
+         # training counterpart.
+-        previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
+-        token_history = torch.cat([previous_context, input_ids], dim=-1)
+-        shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
++        if packed_seq_lens is not None:
++            # Reset history at packed boundaries as well as after EOS tokens.
++            # Concatenate the histories before hashing so lookup communicates once.
++            segments = input_ids.split(packed_seq_lens, dim=1)
++            shifted_tokens = [
++                torch.cat([self._shift_right_ignore_eos(segment, shift) for segment in segments], dim=1)
++                for shift in range(self.ngram_size)
++            ]
++        else:
++            previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
++            token_history = torch.cat([previous_context, input_ids], dim=-1)
++            shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
+ 
+         blocks = []
+         for ngram in range(2, self.ngram_size + 1):
+@@ -372,7 +400,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
          ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1]:]
          if self.cpu_offload:
              return self._host_lookup(ngram_ids)
@@ -383,7 +421,49 @@ index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..d377afad15373363a14529af7391d151
  
      def _init_host_table(self, config, padded_vocab_size, head_dim):
          tp_size = parallel_state.get_tensor_model_parallel_world_size()
-@@ -620,8 +644,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
+@@ -506,7 +539,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
+                 setattr(param, 'sequence_parallel', False)
+                 setattr(param, 'average_gradients_across_tp_domain', config.sequence_parallel)
+ 
+-    def _short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
++    def _short_conv(self, hidden_states: torch.Tensor, packed_seq_lens: Optional[List[int]] = None) -> torch.Tensor:
++        if packed_seq_lens is not None:
++            # Only participating samples are present; alignment padding never
++            # launches its own convolution when real-sample metadata is available.
++            return torch.cat(
++                [self._short_conv(segment) for segment in hidden_states.split(packed_seq_lens, dim=1)], dim=1)
+         # Training variant of transformers `_short_conv` (no conv state cache):
+         # causal alignment is achieved by left-padding the conv input with
+         # zeros (equivalent to trimming the padded conv output), which is a
+@@ -517,11 +555,15 @@ class Qwen4ExpTextPLELayer(nn.Module):
+         conv_input = conv_input[..., -(self.short_conv_state_len + sequence_length):]
+         return F.silu(self.conv1d(conv_input)).transpose(1, 2)
+ 
+-    def compute(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
++    def compute(self,
++                hidden_states: torch.Tensor,
++                input_ids: torch.Tensor,
++                packed_seq_lens: Optional[List[int]] = None) -> torch.Tensor:
+         """Mirrors transformers ``Qwen4ExpTextPLELayer.forward`` (training
+         variant); hidden_states/input_ids: [rows, L, nH]/[rows, L]."""
+-        embeddings = self.ple_embedding(input_ids)  # mcore-specific: no past_key_values cache arg
+-        if use_ple_fused_kernel() and embeddings.device.type != 'cpu':
++        embeddings = self.ple_embedding(input_ids, packed_seq_lens=packed_seq_lens)
++        # The fused kernel does not reset convolution state at packed boundaries.
++        if packed_seq_lens is None and use_ple_fused_kernel() and embeddings.device.type != 'cpu':
+             fused = self._compute_fused(hidden_states, embeddings)
+             if fused is not None:
+                 return fused
+@@ -535,7 +577,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
+         gated_value = gated_value.flatten(-2)
+         # (transformers also applies conv_mask here; training relies on the
+         # loss mask instead.)
+-        output = gated_value + self._short_conv(gated_value_normed)
++        output = gated_value + self._short_conv(gated_value_normed, packed_seq_lens=packed_seq_lens)
+         return output
+ 
+     def _compute_fused(self, hidden_states: torch.Tensor, embeddings: torch.Tensor):
+@@ -620,8 +662,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
              psp_for_cp = packed_seq_params if thd else None
              hidden_states = gather_from_sequence_parallel_region(
                  hidden_states, tensor_parallel_output_grad=True, group=parallel_state.get_context_parallel_group())
@@ -398,6 +478,78 @@ index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..d377afad15373363a14529af7391d151
              # The data pipeline may hand us either a CP-sharded or a full copy of
              # input_ids; re-align only when the lengths disagree.
              if input_ids.shape[-1] != hidden_states.shape[0]:
+@@ -650,6 +696,30 @@ class Qwen4ExpTextPLELayer(nn.Module):
+             out = scatter_to_sequence_parallel_region(out, group=self.pg_collection.tp)
+         return out
+ 
++    @staticmethod
++    def _get_packed_seq_lens(packed_seq_params, total: int) -> List[int]:
++        """Resolve participating segments in the gathered, original-order layout.
++
++        With real-sample metadata, trailing alignment segments are excluded.
++        Otherwise get_num_samples keeps its existing all-segments fallback.
++        """
++        cu = getattr(packed_seq_params, 'cu_seqlens_q', None)
++        if cu is None:
++            raise ValueError('PLE THD computation requires cu_seqlens_q.')
++        cu_padded = getattr(packed_seq_params, 'cu_seqlens_q_padded', None)
++        if cu_padded is not None and cu_padded is not cu and not torch.equal(cu.reshape(-1), cu_padded.reshape(-1)):
++            raise ValueError('PLE THD computation requires cu_seqlens_q and cu_seqlens_q_padded '
++                             'to describe the same storage layout.')
++        # Transfer boundaries once; embedding and convolution reuse Python lengths.
++        boundaries = cu.detach().reshape(-1).cpu().tolist()
++        if (len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != total
++                or any(end <= start for start, end in zip(boundaries[:-1], boundaries[1:]))):
++            raise ValueError(f'PLE THD boundaries must start at 0, increase strictly, and end at {total}.')
++        num_samples = get_num_samples(packed_seq_params)
++        if not 1 <= num_samples < len(boundaries):
++            raise ValueError(f'PLE THD segment count {num_samples} is invalid for {len(boundaries) - 1} segments.')
++        return [boundaries[i + 1] - boundaries[i] for i in range(num_samples)]
++
+     def _forward_impl(
+         self,
+         hidden_states: torch.Tensor,
+@@ -659,26 +729,21 @@ class Qwen4ExpTextPLELayer(nn.Module):
+         """hidden_states: [s, b, nH] (bsh) or thd [T, 1, nH]; input_ids: [b, s] or [1, T]."""
+         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
+         if thd:
+-            num_samples = get_num_samples(packed_seq_params)
+-            # PackedSeqParams.max_seqlen_q is declared `int` in mcore and swift
+-            # normalizes it to int, so `.item()` would raise AttributeError;
+-            # tolerate a 0-d tensor from other callers.
+-            max_seqlen_q = packed_seq_params.max_seqlen_q
+-            max_len = int(max_seqlen_q.item() if torch.is_tensor(max_seqlen_q) else max_seqlen_q)
+-            cu = packed_seq_params.cu_seqlens_q
+             total = hidden_states.shape[0]
+-            hid = hidden_states.new_zeros((num_samples, max_len, hidden_states.shape[-1]))
+-            toks = input_ids.new_full((num_samples, max_len), self.ple_embedding.eos_token_id)
+-            for i in range(num_samples):
+-                start, end = int(cu[i]), int(cu[i + 1])
+-                hid[i, :end - start] = hidden_states[start:end, 0]
+-                toks[i, :end - start] = input_ids[0, start:end]
+-            res = self.compute(hid, toks)
+-            out = res.new_zeros((total, 1, res.shape[-1]))
+-            for i in range(num_samples):
+-                start, end = int(cu[i]), int(cu[i + 1])
+-                out[start:end, 0] = res[i, :end - start]
+-            return out
++            # THD flattens the entire micro-batch into tokens; this singleton
++            # storage dimension does not constrain the configured micro-batch size.
++            if (hidden_states.ndim != 3 or hidden_states.shape[1] != 1 or input_ids.ndim != 2
++                    or input_ids.shape[0] != 1 or input_ids.shape[1] != total):
++                raise ValueError('PLE THD expects hidden_states [T, 1, H] and input_ids [1, T] '
++                                 'in the gathered layout.')
++            packed_seq_lens = self._get_packed_seq_lens(packed_seq_params, total)
++            real_end = sum(packed_seq_lens)
++            hid = hidden_states[:real_end].transpose(0, 1)
++            toks = input_ids[:, :real_end]
++            res = self.compute(hid, toks, packed_seq_lens=packed_seq_lens)
++            if real_end < total:
++                res = F.pad(res, (0, 0, 0, total - real_end))
++            return res.transpose(0, 1).contiguous()
+         else:
+             # [s, b, nH] -> [b, s, nH]; input_ids [b, s]
+             hid = hidden_states.transpose(0, 1)
 diff --git a/src/mcore_bridge/utils/megatron_utils.py b/src/mcore_bridge/utils/megatron_utils.py
 index 03c0863968c6fc32fe75c8d8113e34d3281e208b..3c85af4712f21606dbf2747eeb9602c9f71692e7 100644
 --- a/src/mcore_bridge/utils/megatron_utils.py
