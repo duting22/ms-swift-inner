@@ -1,5 +1,5 @@
 diff --git a/src/mcore_bridge/model/gpts/qwen4_exp.py b/src/mcore_bridge/model/gpts/qwen4_exp.py
-index db2b0e69e9f6d78288043e309871d103c233cde7..9f666e926a66600423063121ad4c76198dc35ea9 100644
+index db2b0e6..9f666e9 100644
 --- a/src/mcore_bridge/model/gpts/qwen4_exp.py
 +++ b/src/mcore_bridge/model/gpts/qwen4_exp.py
 @@ -1,7 +1,6 @@
@@ -143,7 +143,7 @@ index db2b0e69e9f6d78288043e309871d103c233cde7..9f666e926a66600423063121ad4c7619
  
      def build_model(
 diff --git a/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py b/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py
-index 6231c0b1960f46c6a58825b3965bc606ce2861f8..ddcc98785e2d0cc909bfe5398e2d1fde70e3323a 100644
+index 6231c0b..ddcc987 100644
 --- a/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py
 +++ b/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py
 @@ -79,7 +79,7 @@ def _qsa_bs_fwd_kernel(
@@ -164,8 +164,374 @@ index 6231c0b1960f46c6a58825b3965bc606ce2861f8..ddcc98785e2d0cc909bfe5398e2d1fde
          offs_k = kt * BK + tl.arange(0, BK)
          k_in = offs_k < T
  
+diff --git a/src/mcore_bridge/model/modules/kernels/qsa_kernels.py b/src/mcore_bridge/model/modules/kernels/qsa_kernels.py
+index fa57d75..2670022 100644
+--- a/src/mcore_bridge/model/modules/kernels/qsa_kernels.py
++++ b/src/mcore_bridge/model/modules/kernels/qsa_kernels.py
+@@ -1,5 +1,8 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+-"""QSA sparse attention wrappers around the vendored tensor-core triton kernel.
++"""QSA core-attention adapters with selectable Triton and Ascend backends.
++
++``QSA_ATTN_BACKEND=npu_fa`` uses token-exact masks and native Ascend FA, including CP.
++The default remains the vendored Triton implementation described below.
+ 
+ The kernel itself lives in ``qsa_block_sparse_attn.py``, adapted from
+ miles PR #2777 (commit 0f5dff4). This file owns only the glue mcore needs:
+@@ -24,6 +27,8 @@ WHY A KERNEL AT ALL (the decision this file encodes)
+     mathematically equivalent there, and the mask path measures *faster*
+     (8192: 8.4 s/it vs 25.9 s/it) because TE keeps the whole thing fused.
+ """
++import os
++
+ import torch
+ 
+ from mcore_bridge.utils import get_env_args, get_logger
+@@ -34,6 +39,13 @@ logger = get_logger()
+ 
+ QSA_SPARSE_KERNEL_ENV = 'QSA_SPARSE_KERNEL'
+ 
++
++def qsa_attention_backend() -> str:
++    backend = os.environ.get('QSA_ATTN_BACKEND', 'triton').strip().lower()
++    if backend not in ('triton', 'npu_fa'):
++        raise ValueError(f'Unknown QSA_ATTN_BACKEND={backend!r}; choose triton or npu_fa.')
++    return backend
++
+ try:
+     import triton  # noqa: F401  (import guard for the vendored kernel)
+     HAVE_TRITON = True
+@@ -46,12 +58,20 @@ def use_qsa_sparse_kernel() -> bool:
+ 
+ 
+ def qsa_sparse_supported(head_dim: int) -> bool:
+-    """Whether the sparse kernel can run for this head dim.
++    """Whether the requested QSA attention backend can run for this head dim.
+ 
+-    Triton must be importable, ``head_dim`` must be a power of two (the kernel tiles
++    For Triton, ``head_dim`` must be a power of two (the kernel tiles
+     the head with ``tl.arange`` blocks), and the kernel must not be disabled via
+     ``QSA_SPARSE_KERNEL=0``.
+     """
++    if qsa_attention_backend() == 'npu_fa':
++        if not use_qsa_sparse_kernel():
++            raise ValueError('QSA_ATTN_BACKEND=npu_fa cannot be combined with QSA_SPARSE_KERNEL=0: '
++                             'that disables QSA selection under packing.')
++        import torch_npu
++        if not torch_npu.npu.is_available() or head_dim <= 0:
++            raise RuntimeError('QSA_ATTN_BACKEND=npu_fa requires an available Ascend NPU.')
++        return True
+     if not use_qsa_sparse_kernel():
+         return False
+     if not HAVE_TRITON or head_dim <= 0 or (head_dim & (head_dim - 1)):
+@@ -171,7 +191,7 @@ def qsa_sparse_attention(q, k, v, indices, scale, block_size):
+ 
+ 
+ class QSASparseCoreAttention(torch.nn.Module):
+-    """Drop-in ``core_attention`` that runs the QSA sparse triton kernel.
++    """Drop-in ``core_attention`` consuming explicit QSA token selections.
+ 
+     The selection indices ride in on the ``attention_mask`` argument (int64) --
+     the one positional that mcore threads unchanged through both the plain and
+@@ -195,6 +215,8 @@ class QSASparseCoreAttention(torch.nn.Module):
+         # None -> resolved to 1/sqrt(head_dim) at call time, matching TE.
+         self.softmax_scale = softmax_scale
+         self.config = config
++        self.backend = qsa_attention_backend()
++        logger.info(f'QSA core attention backend: {self.backend}')
+         # The kernel tests selection membership per block of compress_ratio
+         # consecutive tokens, so this must be the same value the indexer expanded
+         # its top-k blocks with -- see the contract in qsa_block_sparse_attn.py.
+@@ -215,8 +237,16 @@ class QSASparseCoreAttention(torch.nn.Module):
+         if attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
+             scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1]**-0.5
+             cp_size = self.config.context_parallel_size
++            if self.backend == 'npu_fa' and attention_bias is not None:
++                raise NotImplementedError('The NPU QSA FA backend does not support attention_bias.')
+             if cp_size > 1:
+                 out = self._forward_cp(query, key, value, attention_mask, scale, packed_seq_params)
++            elif self.backend == 'npu_fa':
++                from .qsa_npu_attention import qsa_npu_fusion_attention
++                if attention_bias is not None:
++                    raise NotImplementedError('The NPU QSA FA backend does not support attention_bias.')
++                dropout = getattr(self.config, 'attention_dropout', 0.0) if self.training else 0.0
++                out = qsa_npu_fusion_attention(query, key, value, attention_mask, scale, packed_seq_params, dropout)
+             else:
+                 out = qsa_sparse_attention(query, key, value, attention_mask, scale, self.block_size)
+             # mcore's sbhd core attention returns heads flattened ([s, b, h*d]);
+@@ -270,6 +300,15 @@ class QSASparseCoreAttention(torch.nn.Module):
+ 
+         key_full = _gather_full(key)
+         value_full = _gather_full(value)
++        if self.backend == 'npu_fa':
++            from .qsa_npu_attention import qsa_npu_fusion_attention
++            if q_pos.numel() != query.shape[0]:
++                raise ValueError('CP query positions do not cover the local Q tensor.')
++            local_idx = indices.index_select(0 if thd else 1, q_pos)
++            dropout = getattr(self.config, 'attention_dropout', 0.0) if self.training else 0.0
++            return qsa_npu_fusion_attention(
++                query, key_full, value_full, local_idx, scale, packed_seq_params, dropout,
++                query_positions=q_pos, cp_size=cp_size)
+         # The kernel derives the key bound from the query count (T, Hq, D = q.shape,
+         # then `offs_k < T`), so it structurally requires len(q) == len(k). Under CP
+         # the queries are a 1/cp_size shard while k/v are now full length, so scatter
+diff --git a/src/mcore_bridge/model/modules/kernels/qsa_npu_attention.py b/src/mcore_bridge/model/modules/kernels/qsa_npu_attention.py
+new file mode 100644
+index 0000000..f8bd73a
+--- /dev/null
++++ b/src/mcore_bridge/model/modules/kernels/qsa_npu_attention.py
+@@ -0,0 +1,116 @@
++# Copyright (c) ModelScope Contributors. All rights reserved.
++"""Token-exact QSA masks on the native Ascend training FlashAttention operator.
++
++Each packed document gets its own call: the TND API's single shared SS mask
++cannot encode different content-dependent selections for multiple documents.
++"""
++import torch
++
++
++def packed_document_boundaries(packed_seq_params, total):
++    """Use the same physical token space as Qwen4ExpLayer's packed selector."""
++    cu = getattr(packed_seq_params, 'cu_seqlens_q_padded', None)
++    if cu is None:
++        cu = getattr(packed_seq_params, 'cu_seqlens_q', None)
++    if cu is None:
++        raise ValueError('Packed QSA needs cu_seqlens_q or cu_seqlens_q_padded.')
++    bounds = cu.reshape(-1).tolist() if isinstance(cu, torch.Tensor) else list(cu)
++    if bounds and bounds[0] != 0:
++        if bounds[-1] == total:
++            bounds.insert(0, 0)
++        elif bounds[-1] - bounds[0] == total:
++            first = bounds[0]
++            bounds = [x - first for x in bounds]
++    if (not bounds or bounds[0] != 0 or bounds[-1] != total
++            or any(b < a for a, b in zip(bounds, bounds[1:]))):
++        raise ValueError(f'Cannot align packed QSA boundaries {bounds} with T={total}.')
++    return bounds
++
++
++@torch.no_grad()
++def qsa_indices_to_npu_mask(indices, document_start, document_length, query_positions=None):
++    """[Lq,K] pack token IDs -> [Lq,Lkv] bool mask, True means excluded.
++
++    A separate sentinel column absorbs -1 slots. In particular, holes before
++    valid tail tokens must not mask a real key or terminate the selection.
++    """
++    if indices.ndim != 2:
++        raise ValueError('QSA indices must have one row per document query.')
++    if query_positions is None:
++        if indices.shape[0] != document_length:
++            raise ValueError('Unequal Q/KV lengths need global query positions.')
++        query_positions = torch.arange(document_length, device=indices.device) + document_start
++    elif query_positions.ndim != 1 or query_positions.numel() != indices.shape[0]:
++        raise ValueError('QSA needs one global position for each local query.')
++    local = indices - document_start
++    rows = (query_positions - document_start).unsqueeze(1)
++    valid = (local >= 0) & (local < document_length) & (local <= rows)
++    destinations = torch.where(valid, local, document_length).long()
++    mask = torch.ones((indices.shape[0], document_length + 1), device=indices.device, dtype=torch.bool)
++    mask.scatter_(1, destinations, False)
++    return mask[:, :document_length].contiguous()
++
++
++def _document_attention(query, key, value, indices, document_start, scale, dropout, query_positions=None):
++    import torch_npu
++
++    mask = qsa_indices_to_npu_mask(indices, document_start, key.shape[0], query_positions)
++    # The original main Q/K have already received QK norm and partial RoPE.
++    # Native GQA accepts the local TP ratio, e.g. 3 Q heads : 1 KV head.
++    output = torch_npu.npu_fusion_attention(
++        query.unsqueeze(0).contiguous(),
++        key.unsqueeze(0).contiguous(),
++        value.unsqueeze(0).contiguous(),
++        head_num=query.shape[1],
++        input_layout='BSND',
++        atten_mask=mask,
++        sparse_mode=1,
++        scale=scale,
++        keep_prob=1.0 - dropout,
++    )[0].squeeze(0)
++    return output
++
++
++def qsa_npu_fusion_attention(query, key, value, indices, scale, packed_seq_params=None, dropout=0.0,
++                             query_positions=None, cp_size=1):
++    """Local Q attends full K/V with explicit QSA selections and global positions.
++
++    CP callers gather K/V with autograd before entering here. Packed local Q is
++    still document-major, with each document's front and mirrored back chunks.
++    No zero-filled full-length Q buffer is necessary for native FA.
++    """
++    if query.device.type != 'npu':
++        raise ValueError('QSA_ATTN_BACKEND=npu_fa requires Ascend NPU tensors.')
++    if key.shape != value.shape or cp_size < 1 or query.shape[0] * cp_size != key.shape[0]:
++        raise ValueError('NPU QSA requires local Q length * CP size == full K/V length.')
++    if cp_size > 1 and (query_positions is None or query_positions.numel() != query.shape[0]):
++        raise ValueError('CP QSA requires the global position of every local query.')
++    if query.ndim == 4:
++        # Unpacked sbhd indices use sample-local token IDs.
++        if indices.shape[:2] != (query.shape[1], query.shape[0]):
++            raise ValueError('Unpacked QSA indices must have shape [batch, sequence, K].')
++        outputs = [
++            _document_attention(query[:, b], key[:, b], value[:, b], indices[b], 0, scale, dropout,
++                                query_positions)
++            for b in range(query.shape[1])
++        ]
++        return torch.stack(outputs, dim=1)
++    if query.ndim != 3 or indices.ndim != 2 or indices.shape[0] != query.shape[0]:
++        raise ValueError('Packed QSA expects Q [T,N,D] and indices [T,K].')
++    if packed_seq_params is None:
++        bounds = [0, key.shape[0]]
++    else:
++        bounds = packed_document_boundaries(packed_seq_params, key.shape[0])
++    outputs, local_start = [], 0
++    for start, end in zip(bounds, bounds[1:]):
++        length = end - start
++        if cp_size > 1 and length % (2 * cp_size):
++            raise ValueError('Packed CP QSA requires each physical document padded to 2 * CP size.')
++        local_end = local_start + length // cp_size
++        if length:
++            positions = None if query_positions is None else query_positions[local_start:local_end]
++            outputs.append(_document_attention(
++                query[local_start:local_end], key[start:end], value[start:end],
++                indices[local_start:local_end], start, scale, dropout, positions))
++        local_start = local_end
++    return torch.cat(outputs, dim=0)
+diff --git a/src/mcore_bridge/model/modules/kernels/qsa_npu_indexer.py b/src/mcore_bridge/model/modules/kernels/qsa_npu_indexer.py
+new file mode 100644
+index 0000000..773e92a
+--- /dev/null
++++ b/src/mcore_bridge/model/modules/kernels/qsa_npu_indexer.py
+@@ -0,0 +1,127 @@
++# Copyright (c) ModelScope Contributors. All rights reserved.
++"""Ascend LightningIndexerV2 scoring for frozen QSA compressed key blocks."""
++import math
++
++import torch
++
++
++def _torch_topk_rows(query, block_keys, row_ids, cu_seqlens, full_blocks,
++                     visible_blocks, topk, chunk_bytes):
++    """Rescore ambiguous rows per document, preferring earlier blocks on ties.
++
++    Match QSAIndexer's packed Torch backend: both the candidate space and stable
++    ordering must follow the current baseline, rather than the old global TopK.
++    Callers supply only pruning rows, which have more than ``topk`` visible blocks.
++    """
++    result = torch.empty((row_ids.numel(), topk), dtype=torch.long, device=query.device)
++    bounds = cu_seqlens.tolist()
++    counts = full_blocks.tolist()
++    block_start = 0
++    for (start, end), count in zip(zip(bounds, bounds[1:]), counts):
++        positions = ((row_ids >= start) & (row_ids < end)).nonzero().flatten()
++        if positions.numel():
++            doc_rows = row_ids.index_select(0, positions)
++            keys = block_keys[block_start:block_start + count].float()
++            block_ids = torch.arange(count, device=query.device)
++            chunk = max(1, chunk_bytes // max(1, query.shape[1] * count * 4))
++            for offset in range(0, doc_rows.numel(), chunk):
++                rows = doc_rows[offset:offset + chunk]
++                scores = torch.einsum('thd,kd->thk', query[rows].float(), keys)
++                scores = scores.relu().sum(1) / math.sqrt(query.shape[-1])
++                valid = block_ids[None, :] < visible_blocks[rows, None]
++                scores.masked_fill_(~valid, -torch.inf)
++                selected = torch.sort(scores, dim=-1, descending=True, stable=True).indices[:, :topk]
++                result[positions[offset:offset + rows.numel()]] = selected + block_start
++        block_start += count
++    return result
++
++
++@torch.no_grad()
++def lightning_topk_blocks(query, block_keys, cu_seqlens, full_blocks,
++                          visible_blocks, topk, compress_ratio, chunk_bytes):
++    """Return pack-global block IDs and keep flags for the packed QSA selector.
++
++    Pooling, normalization, and RoPE are performed by QSAIndexer before this call.
++    One extra candidate exposes the TopK boundary. Ambiguous pruning rows use the
++    same per-document FP32/stable selection as the current Torch backend.
++    """
++    if query.device.type != 'npu' or query.dtype not in (torch.bfloat16, torch.float16):
++        raise ValueError('Ascend QSA indexer requires BF16/FP16 NPU query/key tensors.')
++    if query.shape[-1] != 128 or not 0 <= topk < 2048:
++        raise ValueError('Ascend QSA indexer currently requires head_dim=128 and 0 <= block_topk < 2048.')
++    selected = torch.zeros((query.shape[0], topk), dtype=torch.long, device=query.device)
++    keep = torch.zeros_like(selected, dtype=torch.bool)
++    if topk == 0:
++        return selected, keep
++    try:
++        from cann_ops_transformer.ops import lightning_indexer, lightning_indexer_metadata
++    except ImportError as error:
++        raise ImportError('Add $ASCEND_HOME_PATH/python/site-packages to PYTHONPATH for '
++                          'QSA_INDEXER_BACKEND=ascendc.') from error
++
++    bounds = cu_seqlens.tolist()
++    counts = full_blocks.tolist()
++    block_offsets = [0]
++    for count in counts:
++        block_offsets.append(block_offsets[-1] + count)
++    long_docs = []
++    for doc, (start, end) in enumerate(zip(bounds, bounds[1:])):
++        count = counts[doc]
++        if count > topk:
++            long_docs.append(doc)
++        elif count:
++            local_blocks = torch.arange(count, device=query.device)
++            selected[start:end, :count] = block_offsets[doc] + local_blocks
++            keep[start:end, :count] = local_blocks[None, :] < visible_blocks[start:end, None]
++    if not long_docs:
++        return selected, keep
++
++    qs, ks, row_ids = [], [], []
++    cuq, cuk, residuals = [0], [0], []
++    for doc in long_docs:
++        start, end = bounds[doc], bounds[doc + 1]
++        qs.append(query[start:end])
++        ks.append(block_keys[block_offsets[doc]:block_offsets[doc + 1]])
++        row_ids.append(torch.arange(start, end, device=query.device))
++        cuq.append(cuq[-1] + end - start)
++        cuk.append(cuk[-1] + counts[doc])
++        residuals.append((end - start) % compress_ratio)
++    q = torch.cat(qs).contiguous()
++    k = torch.cat(ks).unsqueeze(1).contiguous()
++    rows = torch.cat(row_ids)
++    cuq_t = torch.tensor(cuq, device=query.device, dtype=torch.int32)
++    cuk_t = torch.tensor(cuk, device=query.device, dtype=torch.int32)
++    residual_t = torch.tensor(residuals, device=query.device, dtype=torch.int32)
++    weights = torch.full(q.shape[:2], 1 / math.sqrt(query.shape[-1]),
++                         device=query.device, dtype=torch.float32)
++    native_topk = topk + 1
++    metadata = lightning_indexer_metadata(
++        q.shape[1], 1, q.shape[-1], native_topk,
++        cu_seqlens_q=cuq_t, cu_seqlens_k=cuk_t, cmp_residual_k=residual_t,
++        batch_size=len(long_docs), max_seqlen_q=max(b - a for a, b in zip(cuq, cuq[1:])),
++        max_seqlen_k=max(counts[d] for d in long_docs), layout_q='TND', layout_k='TND',
++        mask_mode=3, cmp_ratio=compress_ratio)
++    native_ids, native_values = lightning_indexer(
++        q, k, weights, native_topk, cu_seqlens_q=cuq_t, cu_seqlens_k=cuk_t,
++        cmp_residual_k=residual_t, metadata=metadata, layout_q='TND', layout_k='TND',
++        mask_mode=3, cmp_ratio=compress_ratio, return_value=1)
++    native_ids = native_ids.squeeze(1).long()
++    native_values = native_values.squeeze(1)
++    for i, doc in enumerate(long_docs):
++        start, end = bounds[doc], bounds[doc + 1]
++        local = native_ids[cuq[i]:cuq[i + 1], :topk]
++        valid = (local >= 0) & (local < visible_blocks[start:end, None])
++        selected[start:end] = torch.where(valid, local + block_offsets[doc], 0)
++        keep[start:end] = valid
++
++    # Preserve stable Torch selection when rounding or ties can change the set.
++    pruning = visible_blocks[rows] > topk
++    left, right = native_values[:, topk - 1], native_values[:, topk]
++    tolerance = 1e-4 * (1.0 + torch.maximum(left.abs(), right.abs()))
++    fallback_rows = rows[pruning & ((left - right) <= tolerance)]
++    if fallback_rows.numel():
++        selected[fallback_rows] = _torch_topk_rows(
++            query, block_keys, fallback_rows, cu_seqlens, full_blocks,
++            visible_blocks, topk, chunk_bytes)
++        keep[fallback_rows] = True
++    return selected, keep
 diff --git a/src/mcore_bridge/model/modules/ple.py b/src/mcore_bridge/model/modules/ple.py
-index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..5405b00294e6f5d7e1ab4b13aea237d64cd28600 100644
+index a39f2d4..5405b00 100644
 --- a/src/mcore_bridge/model/modules/ple.py
 +++ b/src/mcore_bridge/model/modules/ple.py
 @@ -7,16 +7,19 @@ from megatron.core import parallel_state
@@ -550,8 +916,55 @@ index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..5405b00294e6f5d7e1ab4b13aea237d6
          else:
              # [s, b, nH] -> [b, s, nH]; input_ids [b, s]
              hid = hidden_states.transpose(0, 1)
+diff --git a/src/mcore_bridge/model/modules/qsa_indexer.py b/src/mcore_bridge/model/modules/qsa_indexer.py
+index d65b4c5..3dcaa50 100644
+--- a/src/mcore_bridge/model/modules/qsa_indexer.py
++++ b/src/mcore_bridge/model/modules/qsa_indexer.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+ import math
++import os
+ import torch
+ from megatron.core.extensions.transformer_engine import TELinear
+ from torch import nn
+@@ -132,6 +133,9 @@ class QSAIndexer(nn.Module):
+         self.compress_ratio = config.indexer_compress_ratio
+         self.token_budget = config.indexer_budget
+         self.block_topk = self.token_budget // self.compress_ratio
++        self.indexer_backend = os.environ.get('QSA_INDEXER_BACKEND', 'torch').strip().lower()
++        if self.indexer_backend not in ('torch', 'ascendc'):
++            raise ValueError(f'Unknown QSA_INDEXER_BACKEND={self.indexer_backend!r}.')
+         self.index_qk_proj = TELinear(
+             input_size=config.hidden_size,
+             output_size=(self.index_n_heads + self.index_kv_heads) * self.index_head_dim,
+@@ -184,6 +188,8 @@ class QSAIndexer(nn.Module):
+             ``top_blocks``/``keep`` are ``[b, s, k]`` (``k =
+             min(block_topk, max_blocks)``) and ``n_blocks`` is ``[s]``.
+         """
++        if self.indexer_backend != 'torch':
++            raise NotImplementedError('QSA_INDEXER_BACKEND=ascendc currently requires packing/padding_free THD.')
+         s, b, _ = hidden_states.shape
+         R = self.compress_ratio
+         max_blocks = s // R
+@@ -413,8 +419,14 @@ class QSAIndexer(nn.Module):
+ 
+         # ---- score only in-document blocks, chunked over queries ----
+         q_nblocks = (pos_in_doc + 1) // R  # [T]
+-        top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
+-        k = top_blocks.shape[1]
++        if self.indexer_backend == 'ascendc':
++            from .kernels.qsa_npu_indexer import lightning_topk_blocks
++            k = min(self.block_topk, NB)
++            top_blocks, keep = lightning_topk_blocks(
++                q, block_keys, cu_seqlens, full_blocks, q_nblocks, k, R, _QSA_INDEX_SCORE_CHUNK_BYTES)
++        else:
++            top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
++            k = top_blocks.shape[1]
+ 
+         # ---- top-k blocks -> token indices ----
+         arange_r = torch.arange(R, device=device)
 diff --git a/src/mcore_bridge/utils/megatron_utils.py b/src/mcore_bridge/utils/megatron_utils.py
-index 03c0863968c6fc32fe75c8d8113e34d3281e208b..3c85af4712f21606dbf2747eeb9602c9f71692e7 100644
+index 03c0863..3c85af4 100644
 --- a/src/mcore_bridge/utils/megatron_utils.py
 +++ b/src/mcore_bridge/utils/megatron_utils.py
 @@ -12,6 +12,7 @@ from megatron.core.transformer.transformer_block import get_num_layers_to_build
