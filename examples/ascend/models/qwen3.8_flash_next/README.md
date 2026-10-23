@@ -1,11 +1,9 @@
 # 环境准备
 ```
 # bridge
-git clone https://github.com/modelscope/mcore-bridge.git
+git clone https://github.com/duting22/mcore-bridge.git
 cd mcore-bridge
-git checkout 8b567b34e3f9a1087624d45ef0e9474f1021a2f3
-git apply mcore-bridge.8b567b34.patch
-pip install -e .
+git checkout f5872b10bf52f8a1e95d85a5583f4ed289220ea9
 
 # megatron
 git clone https://github.com/NVIDIA/Megatron-LM.git

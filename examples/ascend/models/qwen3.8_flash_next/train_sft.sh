@@ -15,6 +15,7 @@ export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
 
 export PYTHONPATH=/path/to/Megatron-LM:$PYTHONPATH
 export PYTHONPATH=/path/to/MindSpeed:$PYTHONPATH
+export PYTHONPATH=/path/to/mcore-bridge:$PYTHONPATH
 
 export QWEN_CHECKPOINT_TIMEOUT_SECOND=3600
 export USE_MCORE_GDN=1
